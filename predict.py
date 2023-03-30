@@ -1,83 +1,105 @@
 import os
-from typing import Optional, List
+from typing import List
 
 import torch
-import torch.nn as nn
-from torch import autocast
-from diffusers import PNDMScheduler, LMSDiscreteScheduler
-from PIL import Image
 from cog import BasePredictor, Input, Path
-
-from image_to_image import (
-    StableDiffusionImg2ImgPipeline,
-    preprocess_init_image,
-    preprocess_mask,
+from diffusers import (
+    StableDiffusionPipeline,
+    PNDMScheduler,
+    LMSDiscreteScheduler,
+    DDIMScheduler,
+    EulerDiscreteScheduler,
+    EulerAncestralDiscreteScheduler,
+    DPMSolverMultistepScheduler,
 )
+from diffusers.pipelines.stable_diffusion.safety_checker import (
+    StableDiffusionSafetyChecker,
+)
+
 
 def patch_conv(**patch):
     cls = torch.nn.Conv2d
     init = cls.__init__
+
     def __init__(self, *args, **kwargs):
         return init(self, *args, **kwargs, **patch)
+
     cls.__init__ = __init__
 
-patch_conv(padding_mode='circular')
 
+patch_conv(padding_mode="circular")
+
+# MODEL_ID refers to a diffusers-compatible model on HuggingFace
+# e.g. prompthero/openjourney-v2, wavymulder/Analog-Diffusion, etc
+MODEL_ID = "stabilityai/stable-diffusion-2-1"
 MODEL_CACHE = "diffusers-cache"
+SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
 
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
         print("Loading pipeline...")
-        scheduler = PNDMScheduler(
-            beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
+        safety_checker = StableDiffusionSafetyChecker.from_pretrained(
+            SAFETY_MODEL_ID,
+            cache_dir=MODEL_CACHE,
+            local_files_only=True,
         )
-        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-            # "CompVis/stable-diffusion-v1-4",
-            "Mobius-labs/floral_pattern"
-            scheduler=scheduler,
-            revision="fp16",
-            torch_dtype=torch.float16,
+        self.pipe = StableDiffusionPipeline.from_pretrained(
+            MODEL_ID,
+            safety_checker=safety_checker,
             cache_dir=MODEL_CACHE,
             local_files_only=True,
         ).to("cuda")
 
     @torch.inference_mode()
-    @torch.cuda.amp.autocast()
     def predict(
         self,
-        prompt: str = Input(description="Input prompt", default=""),
+        prompt: str = Input(
+            description="Input prompt",
+            default="a photo of an astronaut riding a horse on mars",
+        ),
+        negative_prompt: str = Input(
+            description="Specify things to not see in the output",
+            default=None,
+        ),
         width: int = Input(
             description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
-            choices=[128, 256, 512, 768, 1024],
-            default=512,
+            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            default=768,
         ),
         height: int = Input(
             description="Height of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
-            choices=[128, 256, 512, 768, 1024],
-            default=512,
-        ),
-        init_image: Path = Input(
-            description="Inital image to generate variations of. Will be resized to the specified width and height",
-            default=None,
-        ),
-        mask: Path = Input(
-            description="Black and white image to use as mask for inpainting over init_image. Black pixels are inpainted and white pixels are preserved. Experimental feature, tends to work better with prompt strength of 0.5-0.7",
-            default=None,
+            choices=[128, 256, 384, 448, 512, 576, 640, 704, 768, 832, 896, 960, 1024],
+            default=768,
         ),
         prompt_strength: float = Input(
             description="Prompt strength when using init image. 1.0 corresponds to full destruction of information in init image",
             default=0.8,
         ),
         num_outputs: int = Input(
-            description="Number of images to output", choices=[1, 4], default=1
+            description="Number of images to output.",
+            ge=1,
+            le=4,
+            default=1,
         ),
         num_inference_steps: int = Input(
             description="Number of denoising steps", ge=1, le=500, default=50
         ),
         guidance_scale: float = Input(
             description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
+        ),
+        scheduler: str = Input(
+            default="DPMSolverMultistep",
+            choices=[
+                "DDIM",
+                "K_EULER",
+                "DPMSolverMultistep",
+                "K_EULER_ANCESTRAL",
+                "PNDM",
+                "KLMS",
+            ],
+            description="Choose a scheduler.",
         ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
@@ -88,50 +110,49 @@ class Predictor(BasePredictor):
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
 
-        if width == height == 1024:
+        if width * height > 786432:
             raise ValueError(
                 "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
             )
 
-        if init_image:
-            init_image = Image.open(init_image).convert("RGB")
-            init_image = preprocess_init_image(init_image, width, height).to("cuda")
-
-            # use PNDM with init images
-            scheduler = PNDMScheduler(
-                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-            )
-        else:
-            # use LMS without init images
-            scheduler = LMSDiscreteScheduler(
-                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-            )
-
-        self.pipe.scheduler = scheduler
-
-        if mask:
-            mask = Image.open(mask).convert("RGB")
-            mask = preprocess_mask(mask, width, height).to("cuda")
+        self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
 
         generator = torch.Generator("cuda").manual_seed(seed)
         output = self.pipe(
             prompt=[prompt] * num_outputs if prompt is not None else None,
-            init_image=init_image,
-            mask=mask,
+            negative_prompt=[negative_prompt] * num_outputs
+            if negative_prompt is not None
+            else None,
             width=width,
             height=height,
-            prompt_strength=prompt_strength,
             guidance_scale=guidance_scale,
             generator=generator,
             num_inference_steps=num_inference_steps,
         )
-        if any(output["nsfw_content_detected"]):
-            raise Exception("NSFW content detected, please try a different prompt")
 
         output_paths = []
-        for i, sample in enumerate(output["sample"]):
+        for i, sample in enumerate(output.images):
+            if output.nsfw_content_detected and output.nsfw_content_detected[i]:
+                continue
+
             output_path = f"/tmp/out-{i}.png"
             sample.save(output_path)
             output_paths.append(Path(output_path))
 
+        if len(output_paths) == 0:
+            raise Exception(
+                f"NSFW content detected. Try running it again, or try a different prompt."
+            )
+
         return output_paths
+
+
+def make_scheduler(name, config):
+    return {
+        "PNDM": PNDMScheduler.from_config(config),
+        "KLMS": LMSDiscreteScheduler.from_config(config),
+        "DDIM": DDIMScheduler.from_config(config),
+        "K_EULER": EulerDiscreteScheduler.from_config(config),
+        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
+        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
+    }[name]
