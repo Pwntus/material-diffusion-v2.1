@@ -34,7 +34,8 @@ class Predictor(BasePredictor):
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
         )
         self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-            "CompVis/stable-diffusion-v1-4",
+            # "CompVis/stable-diffusion-v1-4",
+            "Mobius-labs/floral_pattern"
             scheduler=scheduler,
             revision="fp16",
             torch_dtype=torch.float16,

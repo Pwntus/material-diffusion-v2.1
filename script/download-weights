@@ -10,7 +10,8 @@ os.makedirs("diffusers-cache", exist_ok=True)
 
 
 pipe = StableDiffusionPipeline.from_pretrained(
-    "CompVis/stable-diffusion-v1-4",
+    # "CompVis/stable-diffusion-v1-4",
+    "Mobius-labs/floral_pattern"
     cache_dir="diffusers-cache",
     revision="fp16",
     torch_dtype=torch.float16,
