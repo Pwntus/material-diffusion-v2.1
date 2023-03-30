@@ -13,7 +13,7 @@ pipe = StableDiffusionPipeline.from_pretrained(
     # "CompVis/stable-diffusion-v1-4",
     "Mobius-labs/floral_pattern",
     cache_dir="diffusers-cache",
-    revision="fp16",
-    torch_dtype=torch.float16,
+    # revision="fp16",
+    # torch_dtype=torch.float16,
     use_auth_token=sys.argv[1],
 )
